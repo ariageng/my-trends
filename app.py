@@ -1,43 +1,97 @@
 import streamlit as st
 import pandas as pd
-import plotly.graph_objects as go
+import plotly.express as px
+import glob
+import io
+import os
 
-# 页面设置
-st.set_page_config(page_title="趋势动态看板", layout="wide")
+# 页面配置
+st.set_page_config(page_title="人口趋势看板", layout="wide")
 
-# 1. 数据加载逻辑 (增加缓存机制，提升加载速度)
-@st.cache_data
-def load_data():
-    df = pd.read_csv("data/population_data.csv")
-    return df
-
-try:
-    df = load_data()
+def process_nbs_file(filename):
+    """专门解析国家统计局(NBS)那种奇怪格式的函数"""
+    with open(filename, 'r', encoding='utf-8') as f:
+        lines = f.readlines()
     
-    # 2. 侧边栏：动态筛选器
-    st.sidebar.title("🔍 数据维度追加")
-    all_regions = df['region'].unique()
-    selected_region = st.sidebar.selectbox("选择追踪地区", all_regions)
+    # 1. 过滤元数据（去掉前两行和末尾注释）
+    data_lines = []
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith(('数据库：', '时间：', '注：')):
+            continue
+        data_lines.append(line)
     
-    # 3. 核心指标看板 (Metric)
-    st.header(f"📈 {selected_region} 人口趋势监测")
-    latest_val = df[df['region'] == selected_region]['value'].iloc[-1]
-    st.metric(label="当前统计值", value=f"{latest_val} 万", delta="-2% (较去年)")
-
-    # 4. 专业级图表构建
-    sub_df = df[df['region'] == selected_region]
+    # 2. 读取数据：核心在于 sep=',' 配合里面的 \t 清理
+    cleaned_csv = "\n".join(data_lines)
+    # NBS 导出的文件虽然叫 csv，但内容往往是用逗号分隔且带制表符的
+    df = pd.read_csv(io.StringIO(cleaned_csv))
     
-    fig = go.Figure()
-    # 历史数据线
-    hist = sub_df[sub_df['data_type'] == '历史']
-    fig.add_trace(go.Scatter(x=hist['year'], y=hist['value'], name='历史数据', line=dict(color='#1f77b4', width=4)))
+    # 3. 深度清理列名和内容
+    df.columns = [c.replace('\t', '').strip() for c in df.columns]
+    df = df.loc[:, ~df.columns.str.contains('^Unnamed')] # 删掉空列
     
-    # 预测数据线 (虚线)
-    pred = sub_df[sub_df['data_type'] == '预测']
-    fig.add_trace(go.Scatter(x=pred['year'], y=pred['value'], name='模型预测', line=dict(color='#1f77b4', width=4, dash='dot')))
+    for col in df.columns:
+        if df[col].dtype == 'object':
+            df[col] = df[col].str.replace('\t', '').str.strip()
+            
+    # 4. 逆透视：从“宽表”变“长表”，方便画图
+    id_col = '指标'
+    year_cols = [c for c in df.columns if '年' in c]
+    
+    df_long = df.melt(id_vars=[id_col], value_vars=year_cols, var_name='年份', value_name='数值')
+    
+    # 5. 清理数值
+    df_long['年份'] = df_long['年份'].str.replace('年', '').astype(int)
+    df_long['数值'] = pd.to_numeric(df_long['数值'], errors='coerce')
+    df_long = df_long.dropna(subset=['数值'])
+    df_long['来源'] = os.path.basename(filename)
+    
+    return df_long
 
-    fig.update_layout(hovermode="x unified", template="plotly_white")
-    st.plotly_chart(fig, use_container_width=True)
+# --- 网页主体 ---
+st.title("📈 趋势数据自动追踪看板")
 
-except Exception as e:
-    st.error("数据加载失败，请检查 data/population_data.csv 格式")
+# 自动扫描 data 文件夹
+data_files = glob.glob("data/*.csv")
+
+if not data_files:
+    st.info("💡 请在 data/ 文件夹中放入从统计局下载的 CSV 文件。")
+else:
+    # 加载并合并所有数据
+    all_dfs = []
+    for f in data_files:
+        try:
+            all_dfs.append(process_nbs_file(f))
+        except Exception as e:
+            st.error(f"解析 {f} 出错：{e}")
+    
+    if all_dfs:
+        full_df = pd.concat(all_dfs, ignore_index=True)
+        
+        # 侧边栏：丝滑切换
+        st.sidebar.header("控制面板")
+        
+        # 让用户选择指标（自动去重）
+        target_indicator = st.sidebar.selectbox(
+            "选择要追踪的指标", 
+            options=sorted(full_df['指标'].unique())
+        )
+        
+        # 过滤数据
+        plot_df = full_df[full_df['指标'] == target_indicator].sort_values('年份')
+        
+        # 绘图
+        if not plot_df.empty:
+            fig = px.line(plot_df, x='年份', y='数值', 
+                          markers=True, 
+                          title=f"趋势追踪：{target_indicator}",
+                          labels={"数值": "具体数值", "年份": "时间轴"},
+                          template="plotly_dark") # 换个酷炫的深色主题
+            
+            st.plotly_chart(fig, use_container_width=True)
+            
+            # 展示数据源
+            st.caption(f"数据来源文件：{plot_df['来源'].unique().tolist()}")
+            
+            with st.expander("查看原始数据表"):
+                st.dataframe(plot_df)
