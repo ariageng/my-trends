@@ -5,93 +5,114 @@ import glob
 import io
 import os
 
-# 页面配置
-st.set_page_config(page_title="人口趋势看板", layout="wide")
+# --- 页面配置 ---
+st.set_page_config(page_title="高级趋势动态看板", layout="wide")
+st.markdown("""<style> .main { background-color: #0e1117; } </style>""", unsafe_allow_html=True)
 
-def process_nbs_file(filename):
-    """专门解析国家统计局(NBS)那种奇怪格式的函数"""
-    with open(filename, 'r', encoding='utf-8') as f:
-        lines = f.readlines()
+# --- 专家级数据清洗函数 ---
+def nbs_cleaner(file_path):
+    # 1. 自动识别编码并预读取
+    try:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            raw_lines = f.readlines()
+    except UnicodeDecodeError:
+        with open(file_path, 'r', encoding='gb18030') as f:
+            raw_lines = f.readlines()
+
+    # 2. 精准定位数据区 (只保留包含逗号且不包含元数据的行)
+    data_content = []
+    for line in raw_lines:
+        clean_line = line.strip().replace('\t', '') # 强制干掉制表符
+        # 统计局数据行通常包含逗号，且不以特定字符开头
+        if ',' in clean_line and not clean_line.startswith(('数据库', '时间', '注：')):
+            data_content.append(clean_line)
     
-    # 1. 过滤元数据（去掉前两行和末尾注释）
-    data_lines = []
-    for line in lines:
-        line = line.strip()
-        if not line or line.startswith(('数据库：', '时间：', '注：')):
-            continue
-        data_lines.append(line)
+    # 3. 构建初始 DataFrame
+    csv_stream = io.StringIO("\n".join(data_content))
+    df = pd.read_csv(csv_stream, sep=',').dropna(axis=1, how='all')
     
-    # 2. 读取数据：核心在于 sep=',' 配合里面的 \t 清理
-    cleaned_csv = "\n".join(data_lines)
-    # NBS 导出的文件虽然叫 csv，但内容往往是用逗号分隔且带制表符的
-    df = pd.read_csv(io.StringIO(cleaned_csv))
+    # 4. 清洗列名 (去掉空格和"年"字)
+    df.columns = [c.strip() for c in df.columns]
     
-    # 3. 深度清理列名和内容
-    df.columns = [c.replace('\t', '').strip() for c in df.columns]
-    df = df.loc[:, ~df.columns.str.contains('^Unnamed')] # 删掉空列
+    # 5. 转换长表格式 (Tidy Data)
+    id_vars = ['指标']
+    value_vars = [c for c in df.columns if '年' in c]
     
-    for col in df.columns:
-        if df[col].dtype == 'object':
-            df[col] = df[col].str.replace('\t', '').str.strip()
-            
-    # 4. 逆透视：从“宽表”变“长表”，方便画图
-    id_col = '指标'
-    year_cols = [c for c in df.columns if '年' in c]
+    df_long = df.melt(id_vars=id_vars, value_vars=value_vars, var_name='年份', value_name='数值')
     
-    df_long = df.melt(id_vars=[id_col], value_vars=year_cols, var_name='年份', value_name='数值')
-    
-    # 5. 清理数值
-    df_long['年份'] = df_long['年份'].str.replace('年', '').astype(int)
-    df_long['数值'] = pd.to_numeric(df_long['数值'], errors='coerce')
+    # 6. 极致清洗数值
+    df_long['年份'] = df_long['年份'].str.extract('(\d+)').astype(int)
+    # 处理数值中的空格或逗号，并转为浮点数
+    df_long['数值'] = pd.to_numeric(df_long['数值'].astype(str).str.replace(',', ''), errors='coerce')
     df_long = df_long.dropna(subset=['数值'])
-    df_long['来源'] = os.path.basename(filename)
     
+    # 7. 标注来源
+    df_long['来源文件'] = os.path.basename(file_path)
     return df_long
 
-# --- 网页主体 ---
-st.title("📈 趋势数据自动追踪看板")
+# --- 网页主体逻辑 ---
+st.title("🛡️ 劳动市场与人口趋势追踪专家版")
 
-# 自动扫描 data 文件夹
-data_files = glob.glob("data/*.csv")
+# 自动扫描目录
+data_dir = "data"
+if not os.path.exists(data_dir):
+    os.makedirs(data_dir)
 
-if not data_files:
-    st.info("💡 请在 data/ 文件夹中放入从统计局下载的 CSV 文件。")
+files = glob.glob(f"{data_dir}/*.csv")
+
+if not files:
+    st.warning("⚠️ 文件夹 data/ 中未发现 CSV 文件。请将下载的文件上传至该目录。")
 else:
-    # 加载并合并所有数据
-    all_dfs = []
-    for f in data_files:
-        try:
-            all_dfs.append(process_nbs_file(f))
-        except Exception as e:
-            st.error(f"解析 {f} 出错：{e}")
-    
-    if all_dfs:
-        full_df = pd.concat(all_dfs, ignore_index=True)
+    # 加载所有数据并缓存以提高性能
+    @st.cache_data
+    def get_all_data(file_list):
+        return pd.concat([nbs_cleaner(f) for f in file_list], ignore_index=True)
+
+    try:
+        full_data = get_all_data(files)
         
-        # 侧边栏：丝滑切换
-        st.sidebar.header("控制面板")
+        # --- 侧边栏：丝滑筛选 ---
+        st.sidebar.header("数据导航")
         
-        # 让用户选择指标（自动去重）
-        target_indicator = st.sidebar.selectbox(
-            "选择要追踪的指标", 
-            options=sorted(full_df['指标'].unique())
+        # 智能指标搜索
+        search_term = st.sidebar.text_input("🔍 搜索指标 (如: 总人口, 抚养比)", "")
+        filtered_indicators = [i for i in full_data['指标'].unique() if search_term in i]
+        
+        selected_indicator = st.sidebar.selectbox(
+            "选择具体追踪维度", 
+            options=filtered_indicators if filtered_indicators else full_data['指标'].unique()
         )
+
+        # --- 可视化核心区 ---
+        target_df = full_data[full_data['指标'] == selected_indicator].sort_values('年份')
         
-        # 过滤数据
-        plot_df = full_df[full_df['指标'] == target_indicator].sort_values('年份')
+        col1, col2 = st.columns([3, 1])
         
-        # 绘图
-        if not plot_df.empty:
-            fig = px.line(plot_df, x='年份', y='数值', 
-                          markers=True, 
-                          title=f"趋势追踪：{target_indicator}",
-                          labels={"数值": "具体数值", "年份": "时间轴"},
-                          template="plotly_dark") # 换个酷炫的深色主题
-            
+        with col1:
+            fig = px.line(
+                target_df, x='年份', y='数值',
+                markers=True, line_shape='linear',
+                title=f"【{selected_indicator}】历史趋势分析",
+                template="plotly_dark",
+                color_discrete_sequence=['#00D4FF']
+            )
+            fig.update_traces(line_width=3, marker_size=10)
+            fig.update_layout(hovermode="x unified", font=dict(family="Arial", size=14))
             st.plotly_chart(fig, use_container_width=True)
+
+        with col2:
+            st.subheader("关键统计数据")
+            latest_year = target_df['年份'].max()
+            latest_val = target_df[target_df['年份'] == latest_year]['数值'].values[0]
+            st.metric(label=f"{latest_year}年数值", value=f"{latest_val:,.2f}")
             
-            # 展示数据源
-            st.caption(f"数据来源文件：{plot_df['来源'].unique().tolist()}")
-            
-            with st.expander("查看原始数据表"):
-                st.dataframe(plot_df)
+            avg_val = target_df['数值'].mean()
+            st.metric(label="历史平均水平", value=f"{avg_val:,.2f}")
+
+        # 数据表查看
+        with st.expander("📂 点击展开原始数据对账单"):
+            st.table(target_df[['年份', '数值', '来源文件']])
+
+    except Exception as e:
+        st.error(f"🔴 数据处理流异常: {e}")
+        st.info("提示：请检查 CSV 文件是否被损坏，或尝试重新从国家统计局下载。")
